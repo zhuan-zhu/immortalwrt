@@ -1,0 +1,265 @@
+name: prepare-openwrt-source
+description: Prepare OpenWrt build environment and generate .config
+
+inputs:
+  mode:
+    description: full or config-only
+    required: true
+  scenario-files:
+    description: comma-separated scenario file paths, merged in order
+    required: false
+    default: ""
+  export-baseline:
+    description: also export a clean official default config before applying scenario
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+
+    - name: Validate inputs
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        if [[ "$MODE" != "full" && "$MODE" != "config-only" ]]; then
+          echo "::error::mode must be full or config-only, got: $MODE"
+          exit 1
+        fi
+
+    - name: Init env
+      shell: bash
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        set -euo pipefail
+        sudo -E rm -rf /usr/share/dotnet /usr/local/lib/android /etc/mysql /etc/php 2>/dev/null || true
+        sudo -E apt-mark hold grub-efi-amd64-signed || true
+        sudo -E apt-get update -y
+        sudo -E apt-get -y purge 'azure-cli*' 'docker*' 'ghc*' 'zulu*' 'llvm*' 'firefox*' 'google*' \
+          'dotnet*' 'powershell*' 'openjdk*' 'mysql*' 'php*' 'mongodb*' 'snap*' > /dev/null 2>&1 || true
+        sudo -E apt-get -y full-upgrade
+        sudo -E bash -c 'bash <(curl -fsSL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+        sudo -E systemctl daemon-reload
+        sudo -E apt-get -y autoremove --purge
+        sudo -E apt-get clean
+        sudo -E timedatectl set-timezone "Asia/Shanghai"
+
+    - name: Update feeds baseline
+      if: inputs.export-baseline == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        ./scripts/feeds clean
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Generate baseline config
+      if: inputs.export-baseline == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -f ./.config ./.config.old
+        touch ./.config
+        make defconfig
+        cp ./.config ./.config.baseline
+
+    - name: Parse scenario config
+      shell: bash
+      env:
+        SCENARIO_FILES: ${{ inputs.scenario-files }}
+      run: |
+        set -euo pipefail
+
+        FEED_NAME_RE='^[A-Za-z0-9_]+$'
+        REPO_DIR_RE='^package/[A-Za-z0-9_-]+$'
+        URL_RE='^https://'
+
+        trim() {
+          local s="$1"
+          s="${s#"${s%%[![:space:]]*}"}"
+          s="${s%"${s##*[![:space:]]}"}"
+          printf '%s' "$s"
+        }
+
+        MERGED="$(mktemp)"
+        : > "$MERGED"
+
+        IFS=',' read -ra FILES <<< "$SCENARIO_FILES"
+        for f in "${FILES[@]}"; do
+          f="$(trim "$f")"
+          [ -z "$f" ] && continue
+          if [ ! -f "$f" ]; then
+            echo "::error::scenario file not found: $f"
+            exit 1
+          fi
+          cat "$f" >> "$MERGED"
+          echo "" >> "$MERGED"
+        done
+
+        CONFIG_CONTENT="$(mktemp)"
+        : > "$CONFIG_CONTENT"
+
+        declare -A SEEN_KEYS
+        declare -A SEEN_REPOS
+
+        while IFS= read -r line; do
+          trimmed="$(trim "$line")"
+          [ -z "$trimmed" ] && continue
+
+          if [[ "$trimmed" =~ ^#[[:space:]]*CONFIG_[A-Za-z0-9_-]+[[:space:]]+is[[:space:]]+not[[:space:]]+set$ ]]; then
+            key="$(printf '%s' "$trimmed" | grep -oE 'CONFIG_[A-Za-z0-9_-]+')"
+            if [ -n "${SEEN_KEYS[$key]:-}" ] && [ "${SEEN_KEYS[$key]}" != "n" ]; then
+              echo "::error::conflicting key $key: existing=${SEEN_KEYS[$key]} new=n"
+              exit 1
+            fi
+            SEEN_KEYS[$key]="n"
+            echo "$trimmed" >> "$CONFIG_CONTENT"
+            continue
+          fi
+
+          if [[ "$trimmed" =~ ^(CONFIG_[A-Za-z0-9_-]+)=(.+)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            if [ -n "${SEEN_KEYS[$key]:-}" ] && [ "${SEEN_KEYS[$key]}" != "$val" ]; then
+              echo "::error::conflicting key $key: existing=${SEEN_KEYS[$key]} new=$val"
+              exit 1
+            fi
+            SEEN_KEYS[$key]="$val"
+            echo "$trimmed" >> "$CONFIG_CONTENT"
+            continue
+          fi
+
+          if [[ "$trimmed" == EXTRA_FEED:* ]]; then
+            spec="$(trim "${trimmed#EXTRA_FEED:}")"
+            name="$(trim "$(cut -d'|' -f1 <<< "$spec")")"
+            url="$(trim "$(cut -d'|' -f2- <<< "$spec")")"
+            [ "$url" = "$spec" ] && url=""
+
+            if [[ ! "$name" =~ $FEED_NAME_RE ]]; then
+              echo "::error::invalid feed name: $name"
+              exit 1
+            fi
+
+            if [ -z "$url" ]; then
+              if grep -qE "^src-git(-full)?[[:space:]]+${name}([[:space:]]|\$)" feeds.conf.default; then
+                echo "feed already enabled: $name"
+                continue
+              fi
+              if grep -qE "^#[[:space:]]*src-git(-full)?[[:space:]]+${name}([[:space:]]|\$)" feeds.conf.default; then
+                sed -i -E "s,^#[[:space:]]*(src-git(-full)?[[:space:]]+${name}([[:space:]]|\$)),\1,g" feeds.conf.default
+                echo "feed enabled: $name"
+                continue
+              fi
+              echo "::warning::feed not found, no url given: $name"
+              continue
+            fi
+
+            if [[ ! "$url" =~ $URL_RE ]]; then
+              echo "::error::invalid feed url: $url"
+              exit 1
+            fi
+            sed -i -E "/^#?[[:space:]]*src-git(-full)?[[:space:]]+${name}([[:space:]]|\$)/d" feeds.conf.default
+            echo "src-git $name $url" >> feeds.conf.default
+            echo "feed set: $name -> $url"
+            continue
+          fi
+
+          if [[ "$trimmed" == EXTRA_REPO:* ]]; then
+            spec="${trimmed#EXTRA_REPO:}"
+            dir="$(trim "$(cut -d'|' -f1 <<< "$spec")")"
+            url="$(trim "$(cut -d'|' -f2 <<< "$spec")")"
+            branch="$(trim "$(cut -d'|' -f3- <<< "$spec")")"
+
+            if [[ ! "$dir" =~ $REPO_DIR_RE ]]; then
+              echo "::error::invalid repo dir: $dir"
+              exit 1
+            fi
+            if [[ ! "$url" =~ $URL_RE ]]; then
+              echo "::error::invalid repo url: $url"
+              exit 1
+            fi
+            if [ -n "${SEEN_REPOS[$dir]:-}" ] && [ "${SEEN_REPOS[$dir]}" != "$url|$branch" ]; then
+              echo "::error::conflicting repo dir $dir: existing=${SEEN_REPOS[$dir]} new=$url|$branch"
+              exit 1
+            fi
+            SEEN_REPOS[$dir]="$url|$branch"
+
+            if git ls-tree --name-only HEAD "$dir" | grep -q .; then
+              echo "::error::EXTRA_REPO dir '$dir' already exists in upstream source, refusing to overwrite"
+              exit 1
+            fi
+
+            rm -rf "./$dir"
+            if [ -n "$branch" ]; then
+              git clone --depth 1 --branch "$branch" -- "$url" "./$dir"
+            else
+              git clone --depth 1 -- "$url" "./$dir"
+            fi
+            echo "repo cloned: $dir <- $url"
+            continue
+          fi
+
+          if [[ "$trimmed" == \#* ]]; then
+            continue
+          fi
+
+          echo "$trimmed" >> "$CONFIG_CONTENT"
+        done < "$MERGED"
+
+        echo "CONFIG_CONTENT_PATH=$CONFIG_CONTENT" >> "$GITHUB_ENV"
+
+    - name: Update feeds
+      shell: bash
+      run: |
+        set -euo pipefail
+        ./scripts/feeds clean
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Generate config
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -f ./.config ./.config.old
+        touch ./.config
+        cat "$CONFIG_CONTENT_PATH" >> ./.config
+        sed -i 's/^[ \t]*//g' ./.config
+        make defconfig
+        cp ./.config ./.config.used
+
+    - name: Verify config
+      shell: bash
+      run: |
+        set -euo pipefail
+        COUNT=0
+
+        while IFS= read -r line; do
+          [[ "$line" =~ ^(CONFIG_PACKAGE_[A-Za-z0-9_-]+)=(y|m)$ ]] || continue
+          key="${BASH_REMATCH[1]}"
+          if grep -qE "^${key}=(y|m)$" ./.config; then
+            continue
+          elif grep -qE "^# ${key} is not set$" ./.config; then
+            echo "::warning::requested enable but disabled: $key"
+          else
+            echo "::warning::requested enable but not found: $key"
+          fi
+          COUNT=$((COUNT+1))
+        done < "$CONFIG_CONTENT_PATH"
+
+        while IFS= read -r line; do
+          [[ "$line" =~ ^#[[:space:]]*(CONFIG_PACKAGE_[A-Za-z0-9_-]+)[[:space:]]+is[[:space:]]+not[[:space:]]+set$ ]] || continue
+          key="${BASH_REMATCH[1]}"
+          if grep -qE "^# ${key} is not set$" ./.config; then
+            continue
+          elif grep -qE "^${key}=(y|m)$" ./.config; then
+            echo "::warning::requested disable but enabled: $key"
+            COUNT=$((COUNT+1))
+          else
+            echo "::notice::requested disable but not present in config: $key"
+          fi
+        done < "$CONFIG_CONTENT_PATH"
+
+        echo "config verify: $COUNT item(s) not effective"
