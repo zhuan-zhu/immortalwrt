@@ -1,0 +1,10 @@
+# CONFIG_PACKAGE_luci-app-mosdns=y
+# CONFIG_PACKAGE_luci-app-adguardhome=y
+# CONFIG_PACKAGE_luci-app-passwall2=y
+
+# EXTRA_FEED: helloworld
+# EXTRA_FEED: targets
+# EXTRA_FEED: OpenClash|https://github.com/vernesong/OpenClash
+# EXTRA_FEED: passwall2|https://github.com/xiaorouji/openwrt-passwall2.git;main
+# EXTRA_REPO: package/luci-app-adguardhome|https://github.com/kongfl888/luci-app-adguardhome
+# EXTRA_REPO: package/luci-app-passwall2|https://github.com/xiaorouji/openwrt-passwall2
