@@ -1,0 +1,63 @@
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: '30 19 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          lfs: true
+
+      - name: Configure git
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git -c http.https://github.com/.extraheader= fetch --no-tags https://github.com/immortalwrt/immortalwrt.git master
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "no_changes=false" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-ff --no-commit --log FETCH_HEAD; then
+            git merge --abort
+            echo "::error::merge upstream failed, aborted"
+            exit 1
+          fi
+
+      - name: Apply commit message
+        if: steps.merge.outputs.no_changes == 'false'
+        run: |
+          set -euo pipefail
+          mkdir -p ./tmp
+          cp ./.git/MERGE_MSG ./tmp/message
+          sed -i "1c [bot] AutoMerging: merge upstream changes" ./tmp/message
+          git commit --file="./tmp/message"
+
+      - name: Push
+        if: steps.merge.outputs.no_changes == 'false'
+        run: git push origin HEAD:master
