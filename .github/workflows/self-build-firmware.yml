@@ -1,0 +1,198 @@
+name: build-firmware
+
+on:
+  workflow_run:
+    workflows: ["sync-upstream"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: scenario to build
+        type: choice
+        options:
+          - daily
+          - scenario-a
+        default: daily
+
+permissions:
+  contents: read
+
+jobs:
+  determine-matrix:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'schedule')
+    runs-on: ubuntu-24.04
+    outputs:
+      scenarios: ${{ steps.set.outputs.scenarios }}
+    steps:
+      - id: set
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCENARIO: ${{ inputs.scenario }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$SCENARIO" in
+              daily|scenario-a)
+                echo "scenarios=[\"$SCENARIO\"]" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "::error::invalid scenario name: $SCENARIO"
+                exit 1
+                ;;
+            esac
+          else
+            echo 'scenarios=["daily"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: determine-matrix
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'schedule')
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJson(needs.determine-matrix.outputs.scenarios || '[]') }}
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: build-firmware-${{ matrix.scenario }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      statuses: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_branch }}
+          persist-credentials: false
+          lfs: true
+
+      - name: Get real SHA
+        id: real_sha
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Check build state
+        id: check
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCENARIO: ${{ matrix.scenario }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.real_sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! JSON="$(gh api "repos/${REPO}/commits/${SHA}/statuses" 2>/dev/null)"; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RESULT_JSON="$(echo "$JSON" | jq --arg ctx "build/${SCENARIO}" \
+            '[.[] | select(.context==$ctx)] | sort_by(.updated_at) | last' 2>/dev/null || echo null)"
+          if [ "$RESULT_JSON" != "null" ] && [ -n "$RESULT_JSON" ]; then
+            STATE="$(echo "$RESULT_JSON" | jq -r '.state')"
+            if [ "$STATE" = "success" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "last_run_url=$(echo "$RESULT_JSON" | jq -r '.target_url')" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report skip
+        if: steps.check.outputs.skip == 'true'
+        env:
+          LAST_RUN_URL: ${{ steps.check.outputs.last_run_url }}
+        run: echo "no change since last build, see $LAST_RUN_URL"
+
+      - uses: ./.github/self-actions/prepare-openwrt-source
+        if: steps.check.outputs.skip != 'true'
+        with:
+          mode: full
+          scenario-files: .github/self-configs/packages/${{ matrix.scenario }}
+          export-baseline: 'true'
+
+      - name: Download
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          make download -j16 || make download -j1 V=s
+
+      - name: Build
+        if: steps.check.outputs.skip != 'true'
+        run: make -j$(nproc) || make -j1 V=s
+
+      - name: Disk usage
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          df -h
+          du -h --max-depth=1 ./ --exclude=build_dir --exclude=bin || true
+          du -h --max-depth=1 ./build_dir || true
+          du -h --max-depth=1 ./bin || true
+
+      - name: SHA256
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          find ./bin/targets -type f \( -name "*.bin" -o -name "*.img.gz" -o -name "*.img" -o -name "*.itb" -o -name "*.tar.zst" \) \
+            -exec sh -c 'sha256sum "$1" > "$1.sha256"' _ {} \;
+
+      - name: Collect buildinfo
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          find ./bin/targets -type d -name packages -exec rm -rf {} +
+          mkdir -p ./artifact-buildinfo
+          cd ./bin/targets
+          find . -type f \( -name "*.buildinfo" -o -name "*.manifest" \) \
+            -exec cp --parents {} ../../artifact-buildinfo/ \;
+
+      - name: Collect config
+        if: steps.check.outputs.skip != 'true'
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          mkdir -p ./artifact-config
+          cp ./.config.used "./artifact-config/${SCENARIO}.config.used"
+          cp ./.config.baseline ./artifact-config/upstream-default.config.baseline
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          name: firmware-${{ matrix.scenario }}
+          path: ./bin/targets/
+          retention-days: 90
+          overwrite: true
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          name: buildinfo-${{ matrix.scenario }}
+          path: ./artifact-buildinfo/
+          retention-days: 90
+          overwrite: true
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.skip != 'true'
+        with:
+          name: config-${{ matrix.scenario }}
+          path: ./artifact-config/
+          retention-days: 90
+          overwrite: true
+
+      - name: Mark build state
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCENARIO: ${{ matrix.scenario }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.real_sha.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${REPO}/statuses/${SHA}" \
+            -f state=success \
+            -f context="build/${SCENARIO}" \
+            -f target_url="${RUN_URL}" \
+            -f description="firmware built"
