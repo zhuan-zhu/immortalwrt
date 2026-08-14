@@ -62,7 +62,6 @@ jobs:
     permissions:
       contents: read
       statuses: write
-      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,7 +84,7 @@ jobs:
           SHA: ${{ steps.real_sha.outputs.sha }}
         run: |
           set -euo pipefail
-          if ! JSON="$(gh api "repos/${REPO}/commits/${SHA}/statuses" 2>/dev/null)"; then
+          if ! JSON="$(gh api "repos/${REPO}/commits/${SHA}/statuses")"; then
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -103,11 +102,18 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Report skip
+      - name: Generate skip summary
         if: steps.check.outputs.skip == 'true'
         env:
           LAST_RUN_URL: ${{ steps.check.outputs.last_run_url }}
-        run: echo "no change since last build, see $LAST_RUN_URL"
+        run: |
+          {
+            echo "## Build Skipped: No changes since last successful build"
+            echo ""
+            echo "This run skipped the build because the upstream and local configurations have not changed."
+            echo ""
+            echo "You can download the firmware artifacts from the [last successful build]($LAST_RUN_URL)."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: ./.github/self-actions/prepare-openwrt-source
         if: steps.check.outputs.skip != 'true'
@@ -133,20 +139,10 @@ jobs:
           du -h --max-depth=1 ./build_dir || true
           du -h --max-depth=1 ./bin || true
 
-      - name: SHA256
-        if: steps.check.outputs.skip != 'true'
-        run: |
-          find ./bin/targets -type f \( -name "*.bin" -o -name "*.img.gz" -o -name "*.img" -o -name "*.itb" -o -name "*.tar.zst" \) \
-            -exec sh -c 'sha256sum "$1" > "$1.sha256"' _ {} \;
-
-      - name: Collect buildinfo
+      - name: Clean up packages
         if: steps.check.outputs.skip != 'true'
         run: |
           find ./bin/targets -type d -name packages -exec rm -rf {} +
-          mkdir -p ./artifact-buildinfo
-          cd ./bin/targets
-          find . -type f \( -name "*.buildinfo" -o -name "*.manifest" \) \
-            -exec cp --parents {} ../../artifact-buildinfo/ \;
 
       - name: Collect config
         if: steps.check.outputs.skip != 'true'
@@ -162,14 +158,6 @@ jobs:
         with:
           name: firmware-${{ matrix.scenario }}
           path: ./bin/targets/
-          retention-days: 90
-          overwrite: true
-
-      - uses: actions/upload-artifact@v4
-        if: steps.check.outputs.skip != 'true'
-        with:
-          name: buildinfo-${{ matrix.scenario }}
-          path: ./artifact-buildinfo/
           retention-days: 90
           overwrite: true
 
