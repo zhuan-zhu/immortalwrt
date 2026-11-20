@@ -63,7 +63,7 @@ jobs:
       contents: read
       statuses: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.workflow_run.head_branch }}
           persist-credentials: false
@@ -153,7 +153,7 @@ jobs:
           cp ./.config.used "./artifact-config/${SCENARIO}.config.used"
           cp ./.config.baseline ./artifact-config/upstream-default.config.baseline
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: steps.check.outputs.skip != 'true'
         with:
           name: firmware-${{ matrix.scenario }}
@@ -161,7 +161,7 @@ jobs:
           retention-days: 14
           overwrite: true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: steps.check.outputs.skip != 'true'
         with:
           name: config-${{ matrix.scenario }}
