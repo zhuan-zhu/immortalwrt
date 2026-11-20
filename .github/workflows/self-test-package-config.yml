@@ -24,7 +24,7 @@ jobs:
       contents: read
       actions: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
           lfs: true
@@ -37,7 +37,7 @@ jobs:
       - name: Show feeds result
         run: cat feeds.conf.default
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: package-probe-${{ inputs.testconfig }}
           path: ./.config
