@@ -41,6 +41,6 @@ jobs:
         with:
           name: package-probe-${{ inputs.testconfig }}
           path: ./.config
-          retention-days: 90
+          retention-days: 14
           if-no-files-found: ignore
           overwrite: true
